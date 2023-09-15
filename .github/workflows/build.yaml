@@ -1,0 +1,94 @@
+# Based on:
+#
+# https://github.com/buroa/pkgs/blob/main/.github/workflows/build.yaml
+---
+name: "Build"
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build kernel and installer images
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Maximize build space
+        uses: edcdavid/free-disk-space@main
+        with:
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Get short commit hash
+        id: hash
+        run: echo "sha_short=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v2
+        with:
+          registry: ghcr.io
+          username: hackworthltd
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build kernel image
+        run: make kernel PLATFORM=linux/amd64 USERNAME=hackworthltd PUSH=true
+
+      - name: Get latest talos release
+        uses: pozetroninc/github-action-get-latest-release@master
+        id: talos
+        with:
+          owner: siderolabs
+          repo: talos
+          excludes: prerelease, draft
+
+      - name: Create Dockerfile
+        uses: DamianReeves/write-file-action@master
+        with:
+          path: ./Dockerfile
+          write-mode: overwrite
+          contents: |
+            FROM ghcr.io/siderolabs/installer:${{ steps.talos.outputs.release }} as installer
+            FROM ghcr.io/hackworthltd/kernel:${{ steps.hash.outputs.sha_short }} as kernel
+
+            FROM alpine:latest AS initramfs-amd64
+            RUN apk add --no-cache --update \
+                cpio \
+                squashfs-tools \
+                xz
+            WORKDIR /initramfs
+            COPY --from=installer /usr/install/amd64/initramfs.xz /usr/install/amd64/initramfs.xz
+            RUN xz -d /usr/install/amd64/initramfs.xz \
+                && cpio -idvm < /usr/install/amd64/initramfs \
+                && unsquashfs -f -d /rootfs rootfs.sqsh \
+                && for f in /lib/modules; do rm -rfv /rootfs$f; done \
+                && rm /usr/install/amd64/initramfs \
+                && rm rootfs.sqsh
+            COPY --from=kernel /lib/modules /rootfs/lib/modules
+            RUN find /rootfs \
+                && mksquashfs /rootfs rootfs.sqsh -all-root -noappend -comp xz -Xdict-size 100% -no-progress \
+                && set -o pipefail && find . 2>/dev/null | cpio -H newc -o | xz -v -C crc32 -0 -e -T 0 -z >/usr/install/amd64/initramfs.xz \
+                && rm -rf /rootfs \
+                && rm -rf /initramfs
+            WORKDIR /
+
+            FROM scratch as archive-initramfs-amd64
+            COPY --from=initramfs-amd64 /usr/install/amd64/initramfs.xz /initramfs.xz
+
+            FROM installer
+            COPY --from=archive-initramfs-amd64 /initramfs.xz /usr/install/amd64/initramfs.xz
+            COPY --from=kernel /boot/vmlinuz /usr/install/amd64/vmlinuz
+
+      - name: Build installer image
+        run: |
+          IMAGE_NAME="ghcr.io/hackworthltd/installer:${{ steps.talos.outputs.release }}"
+          DOCKER_BUILDKIT=0 docker build -t "$IMAGE_NAME" . && docker push "$IMAGE_NAME"
